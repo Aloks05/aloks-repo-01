@@ -1,0 +1,290 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Alok's CFT for POC Deployment
+Parameters:
+  VPC:
+    Type: AWS::EC2::VPC::Id
+    Description: Select an existing VPC
+  PrivateSubnets:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Select existing Private subnets
+  PublicSubnets:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Select existing Public subnets    
+  EKSNodeInstanceType:
+    Type: String
+    Default: t3.medium
+    AllowedValues:
+      - t3.small
+      - t3.medium
+      - t3.large
+      - t3.xlarge
+      - t3.2xlarge
+    Description: Select EKS node instance type
+  RDSInstanceType:
+    Type: String
+    Default: db.m5d.large
+    AllowedValues:
+      - db.m5d.large
+      - db.m5d.xlarge
+      - db.m5d.2xlarge
+      - db.m5d.large
+      - db.m5d.2xlarge
+  DBStorage:
+    Type: String
+    Default: 20        
+    Description: Select RDS storage vlaue   
+  # AMIWindows:
+  #   Type: AWS::EC2::Image::Id
+  #   Description: Provide the AMI ID for the Windows server
+  # AMILinux:
+  #   Type: AWS::EC2::Image::Id
+  #   Description: Provide the AMI ID for the Linux server
+  Region:
+    Type: String
+    Default: us-east-1
+    AllowedValues:
+      - us-east-1
+      - us-west-1
+      - us-west-2
+      - eu-west-1
+      - eu-central-1
+    Description: Select the region for deployment
+  KeyPairWindows:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Select the key pair for the Windows server
+  KeyPairLinux:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Select the key pair for the Linux server    
+
+Resources:
+  # RDSInstance:
+  #   Type: AWS::RDS::DBInstance
+  #   Properties:
+  #     DBInstanceClass: !Ref RDSInstanceType
+  #     Engine: postgres
+  #     MasterUsername: Infosys
+  #     MasterUserPassword: password
+  #     AllocatedStorage: !Ref DBStorage
+  #     VPCSecurityGroups:
+  #       - !GetAtt RDSSecurityGroup.GroupId
+  #     DBSubnetGroupName: !Ref DBSubnetGroup
+  #     MultiAZ: false
+
+  # DBSubnetGroup:
+  #   Type: AWS::RDS::DBSubnetGroup
+  #   Properties:
+  #     DBSubnetGroupDescription: Subnet group for RDS
+  #     SubnetIds: !Ref PrivateSubnets
+
+  # RDSSecurityGroup:
+  #   Type: AWS::EC2::SecurityGroup
+  #   Properties:
+  #     GroupDescription: Security group for RDS
+  #     VpcId: !Ref VPC
+
+  EKSCluster:
+    Type: AWS::EKS::Cluster
+    Properties:
+      Name: EKSCluster
+      ResourcesVpcConfig:
+        SubnetIds: !Ref PrivateSubnets
+        EndpointPrivateAccess: true
+        EndpointPublicAccess: false
+      RoleArn: !GetAtt EKSClusterRole.Arn
+
+  EKSClusterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 
+                - eks.amazonaws.com
+            Action: 
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+        - arn:aws:iam::aws:policy/AmazonEKSServicePolicy        
+
+  EKSNodeGroup:
+    Type: AWS::EKS::Nodegroup
+    Properties:
+      ClusterName: !Ref EKSCluster
+      NodeRole: !GetAtt EKSNodeRole.Arn
+      Subnets: !Ref PrivateSubnets
+      ScalingConfig:
+        MinSize: 2
+        MaxSize: 10
+      # InstanceTypes: 
+      #   - !Ref EKSNodeInstanceType
+      LaunchTemplate:
+        Id: !Ref EKSNodeLaunchTemplate
+
+  EKSNodeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 
+                - ec2.amazonaws.com
+            Action: 
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+
+  EKSNodeLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        InstanceType: !Ref EKSNodeInstanceType
+        UserData: !Base64 |
+          #!/bin/bash
+          yum install -y aws-cli
+          aws autoscaling put-scheduled-update-group-action --scheduled-action-name "ScaleUp" --auto-scaling-group-name "EKSNodeGroup" --start-time "11:30:00" --recurrence "0 6 * * *" --min-size 2 --max-size 10
+          aws autoscaling put-scheduled-update-group-action --scheduled-action-name "ScaleDown" --auto-scaling-group-name "EKSNodeGroup" --start-time "23:30:00" --recurrence "0 18 * * *" --min-size 0 --max-size 0
+
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: ALB
+      Subnets: !Ref PublicSubnets
+      SecurityGroups:
+        - !GetAtt ALBSecurityGroup.GroupId
+      Scheme: internet-facing
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for ALB
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          DestinationSecurityGroupId: !GetAtt EKSSecurityGroup.GroupId
+
+  EKSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for EKS
+      VpcId: !Ref VPC
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: ALBTargetGroup
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: instance
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: traffic-port
+      HealthCheckPath: /
+      Matcher:
+        HttpCode: 200
+
+  VPCEndpointEC2:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub "com.amazonaws.${Region}.ec2"
+      VpcId: !Ref VPC
+      VpcEndpointType: Interface        
+
+###########ADD other EP's
+
+  # WindowsServer:
+  #   Type: AWS::EC2::Instance
+  #   Properties:
+  #     InstanceType: t3.medium
+  #     ImageId: !Ref AMIWindows
+  #     SubnetId: !Select [0, !Ref PrivateSubnets]
+  #     SecurityGroupIds:
+  #       - !GetAtt WindowsSecurityGroup.GroupId
+  #     KeyName: !Ref KeyPairWindows  
+  #     Tags:
+  #       - Key: Name
+  #         Value: DBS Bastion
+
+  # WindowsSecurityGroup:
+  #   Type: AWS::EC2::SecurityGroup
+  #   Properties:
+  #     GroupDescription: Security group for Windows server
+  #     VpcId: !Ref VPC
+  #     SecurityGroupIngress:
+  #       - IpProtocol: tcp
+  #         FromPort: 3389
+  #         ToPort: 3389
+  #         CidrIp: 0.0.0.0/0
+  #     SecurityGroupEgress:
+  #       - IpProtocol: -1
+  #         CidrIp: 0.0.0.0/0
+
+  # LinuxServer:
+  #   Type: AWS::EC2::Instance
+  #   Properties:
+  #     InstanceType: t3.medium
+  #     ImageId: !Ref AMILinux
+  #     SubnetId: !Select [1, !Ref PrivateSubnets]
+  #     SecurityGroupIds:
+  #       - !GetAtt LinuxSecurityGroup.GroupId
+  #     KeyName: !Ref KeyPairLinux  
+  #     Tags:
+  #       - Key: Name
+  #         Value: General Bastion
+
+  # LinuxSecurityGroup:
+  #   Type: AWS::EC2::SecurityGroup
+  #   Properties:
+  #     GroupDescription: Security group for Linux server
+  #     VpcId: !Ref VPC
+  #     SecurityGroupIngress:
+  #       - IpProtocol: tcp
+  #         FromPort: 22
+  #         ToPort: 22
+  #         CidrIp: 0.0.0.0/0
+  #     SecurityGroupEgress:
+  #       - IpProtocol: -1
+  #         CidrIp: 0.0.0.0/0
+
+  ECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: my-ecr-repo
+
+Outputs:
+  EKSClusterName:
+    Description: Name of the EKS Cluster
+    Value: !Ref EKSCluster
+  # ALBName:
+  #   Description: Name of the ALB
+  #   Value: !Ref ALB
+  # WindowsServerId:
+  #   Description: Instance ID of the Windows server
+  #   Value: !Ref WindowsServer
+  # LinuxServerId:
+  #   Description: Instance ID of the Linux server
+  #   Value: !Ref LinuxServer
+  ECRRepoUri:
+    Description: URI of the ECR Repository
+    Value: !GetAtt ECRRepository.RepositoryUri
